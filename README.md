@@ -1,6 +1,8 @@
 How to install and stuff:
 https://blog.invid.eu/
 
+This is for ZAP Proxy tested with version 2.17
+
 **Problem**
 
 Authentication Cookie Synchronization During Security Testing
