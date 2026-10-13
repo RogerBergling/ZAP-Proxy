@@ -1,0 +1,314 @@
+/*
+Minimal ZAP HTTP Sender:
+- Captures Set-Cookie headers
+- Maintains an in-memory cookie jar per host
+- Injects Cookie headers on outgoing requests
+- Uses ConcurrentHashMap for thread safety
+- No global cookie fallback
+*/
+
+var ConcurrentHashMap =
+    Java.type('java.util.concurrent.ConcurrentHashMap');
+
+var logger =
+    org.apache.logging.log4j.LogManager.getLogger(
+        "CookieJar-Minimal"
+    );
+
+// host -> (cookieName -> cookieInfo)
+var cookieJar = new ConcurrentHashMap();
+
+/**
+ * Parse Set-Cookie header
+ */
+function parseSetCookieHeader(setCookieStr) {
+
+    if (!setCookieStr) {
+        return null;
+    }
+
+    var parts = setCookieStr.split(";");
+    var nv = parts[0].trim();
+
+    var idx = nv.indexOf("=");
+
+    if (idx < 0) {
+        return null;
+    }
+
+    var info = {
+        name: nv.substring(0, idx),
+        value: nv.substring(idx + 1),
+        domain: null,
+        path: "/",
+        secure: false,
+        httpOnly: false,
+        expires: null,
+        raw: setCookieStr
+    };
+
+    for (var i = 1; i < parts.length; i++) {
+
+        var a = parts[i].trim();
+        var al = a.toLowerCase();
+
+        if (al.indexOf("domain=") === 0) {
+            info.domain = a.substring(7);
+        } else if (al.indexOf("path=") === 0) {
+            info.path = a.substring(5);
+        } else if (al === "secure") {
+            info.secure = true;
+        } else if (al === "httponly") {
+            info.httpOnly = true;
+        } else if (al.indexOf("expires=") === 0) {
+            info.expires = a.substring(8);
+        }
+    }
+
+    return info;
+}
+
+/**
+ * Store cookie for host
+ */
+function storeCookieForHost(host, cookieInfo) {
+
+    try {
+
+        if (!host || !cookieInfo) {
+            return;
+        }
+
+        var perHost = cookieJar.get(host);
+
+        if (perHost == null) {
+
+            perHost = new ConcurrentHashMap();
+
+            var existing =
+                cookieJar.putIfAbsent(host, perHost);
+
+            if (existing != null) {
+                perHost = existing;
+            }
+        }
+
+        var old = perHost.put(
+            cookieInfo.name,
+            cookieInfo
+        );
+
+        if (old == null) {
+
+            logger.info(
+                "NEW cookie: " +
+                cookieInfo.name +
+                " (" +
+                host +
+                ")"
+            );
+
+        } else if (old.value !== cookieInfo.value) {
+
+            logger.info(
+                "UPDATED cookie: " +
+                cookieInfo.name +
+                " (" +
+                host +
+                ")"
+            );
+        }
+
+    } catch (e) {
+
+        logger.error(
+            "storeCookieForHost error: " + e
+        );
+    }
+}
+
+/**
+ * Build Cookie header
+ */
+function buildCookieHeader(
+    host,
+    existingCookieHeader
+) {
+
+    var map = Object.create(null);
+
+    // Existing request cookies
+    if (existingCookieHeader) {
+
+        var parts =
+            existingCookieHeader.split(";");
+
+        for (var i = 0; i < parts.length; i++) {
+
+            var p = parts[i].trim();
+
+            if (!p) {
+                continue;
+            }
+
+            var idx = p.indexOf("=");
+
+            if (idx > -1) {
+                map[p.substring(0, idx)] =
+                    p.substring(idx + 1);
+            } else {
+                map[p] = "";
+            }
+        }
+    }
+
+    // Stored cookies for host
+    if (host) {
+
+        var perHost = cookieJar.get(host);
+
+        if (perHost != null) {
+
+            var it =
+                perHost.keySet().iterator();
+
+            while (it.hasNext()) {
+
+                var name = it.next();
+                var info = perHost.get(name);
+
+                if (info != null) {
+                    map[name] = info.value;
+                }
+            }
+        }
+    }
+
+    var pairs = [];
+
+    for (var k in map) {
+
+        if (
+            Object.prototype.hasOwnProperty.call(
+                map,
+                k
+            )
+        ) {
+            pairs.push(k + "=" + map[k]);
+        }
+    }
+
+    return pairs.join("; ");
+}
+
+/**
+ * Called before request
+ */
+function sendingRequest(
+    msg,
+    initiator,
+    helper
+) {
+
+    try {
+
+        var reqHeader =
+            msg.getRequestHeader();
+
+        var host =
+            reqHeader.getHostName();
+
+        var existing =
+            reqHeader.getHeader("Cookie");
+
+        var cookieHeader =
+            buildCookieHeader(
+                host,
+                existing
+            );
+
+        if (
+            cookieHeader &&
+            cookieHeader.length > 0
+        ) {
+            reqHeader.setHeader(
+                "Cookie",
+                cookieHeader
+            );
+        }
+
+    } catch (e) {
+
+        logger.error(
+            "sendingRequest error: " + e
+        );
+    }
+}
+
+/**
+ * Called after response
+ */
+function responseReceived(
+    msg,
+    initiator,
+    helper
+) {
+
+    try {
+
+        var respHeader =
+            msg.getResponseHeader();
+
+        if (!respHeader) {
+            return;
+        }
+
+        var host =
+            msg.getRequestHeader()
+               .getHostName();
+
+        var scList =
+            respHeader.getHeaderValues(
+                "Set-Cookie"
+            );
+
+        if (
+            scList != null &&
+            scList.size() > 0
+        ) {
+
+            for (
+                var i = 0;
+                i < scList.size();
+                i++
+            ) {
+
+                var cookie =
+                    parseSetCookieHeader(
+                        scList.get(i)
+                    );
+
+                if (cookie) {
+
+                    storeCookieForHost(
+                        host,
+                        cookie
+                    );
+
+                    logger.debug(
+                        "Captured cookie: " +
+                        cookie.name +
+                        " for " +
+                        host
+                    );
+                }
+            }
+        }
+
+    } catch (e) {
+
+        logger.error(
+            "responseReceived error: " + e
+        );
+    }
+}
