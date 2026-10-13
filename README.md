@@ -1,4 +1,5 @@
 **Problem**
+
 Authentication Cookie Synchronization During Security Testing
 
 **Background**
