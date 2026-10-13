@@ -1,3 +1,6 @@
+How to install and stuff:
+https://blog.invid.eu/
+
 **Problem**
 
 Authentication Cookie Synchronization During Security Testing
